@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use probe_rs_target::{MemoryRange, MemoryRegion, NvmRegion};
+use probe_rs_target::{MemoryRange, MemoryRegion, NvmRegion, SectorInfo};
 
 use crate::Session;
 use crate::flashing::progress::ProgressOperation;
+use crate::flashing::{ActiveFlasher, FlashLayout, FlashSector, LoadedRegion, Operation};
 use crate::flashing::{FlashError, FlashLoader, flasher::Flasher};
-use crate::flashing::{FlashLayout, FlashSector};
 
 use super::FlashProgress;
 
@@ -171,91 +171,36 @@ pub fn erase(
     address_end: u64,
     read_flasher_rtt: bool,
 ) -> Result<(), FlashError> {
-    tracing::debug!("Erasing {address_start:08x}..{address_end:08x}");
+    erase_inner(
+        session,
+        progress,
+        address_start,
+        address_end,
+        read_flasher_rtt,
+        Flasher::run_erase,
+        |sectors| {
+            move |active, _| {
+                sectors
+                    .iter()
+                    .map(
+                        |&SectorInfo {
+                             base_address: address,
+                             size,
+                         }| FlashSector { address, size },
+                    )
+                    .try_for_each(|sector| {
+                        tracing::debug!(
+                            "    sector: {:#010x}-{:#010x} ({} bytes)",
+                            sector.address,
+                            sector.address + sector.size,
+                            sector.size
+                        );
 
-    let address_range = address_start..address_end;
-
-    let mut algos: HashMap<(String, String), Vec<NvmRegion>> = HashMap::new();
-    tracing::debug!("Regions:");
-    for region in session
-        .target()
-        .memory_map
-        .iter()
-        .filter_map(MemoryRegion::as_nvm_region)
-    {
-        tracing::debug!(
-            "    region: {:#010x?} ({} bytes)",
-            region.range,
-            region.range.end - region.range.start
-        );
-
-        // If we have nothing to do in this region, ignore it.
-        // This avoids uselessly initializing and deinitializing its flash algorithm.
-        // We do not check for alias regions here, as we'll work with them if the range explicitly
-        // targets them.
-        if !region.range.intersects_range(&address_range) {
-            tracing::debug!("     -- doesn't overlap, ignoring!");
-            continue;
-        }
-
-        // Get the first core that can access the region
-        let core_name = region
-            .cores
-            .first()
-            .ok_or_else(|| FlashError::NoNvmCoreAccess(region.clone()))?;
-
-        let algo =
-            FlashLoader::get_flash_algorithm_for_region(region, session.target(), core_name, &[])?;
-
-        let entry = algos
-            .entry((algo.name.clone(), core_name.clone()))
-            .or_default();
-        entry.push(region.clone());
-
-        tracing::debug!("     -- using algorithm: {}", algo.name);
-    }
-
-    for ((algo_name, core_name), regions) in algos {
-        tracing::debug!("Erasing with algorithm: {}", algo_name);
-
-        // This can't fail, algo_name comes from the target.
-        let algo = session.target().flash_algorithm_by_name(&algo_name);
-        let algo = algo.unwrap();
-
-        let core_index = session.target().core_index_by_name(&core_name).unwrap();
-        let mut flasher = Flasher::new(session.target(), core_index, algo)?;
-
-        flasher.read_rtt_output(read_flasher_rtt);
-
-        let sectors = flasher
-            .flash_algorithm()
-            .iter_sectors()
-            .filter(|info| address_range.contains_range(&info.address_range()))
-            .filter(|info| {
-                let range = info.base_address..info.base_address + info.size;
-                regions.iter().any(|r| r.range.contains_range(&range))
-            })
-            .collect::<Vec<_>>();
-
-        flasher.run_erase(session, progress, |active, _| {
-            for info in sectors {
-                tracing::debug!(
-                    "    sector: {:#010x}-{:#010x} ({} bytes)",
-                    info.base_address,
-                    info.base_address + info.size,
-                    info.size
-                );
-
-                let sector = FlashSector {
-                    address: info.base_address,
-                    size: info.size,
-                };
-
-                active.erase_sector(&sector)?;
+                        active.erase_sector(&sector)
+                    })
             }
-            Ok(())
-        })?;
-    }
+        },
+    )?;
 
     Ok(())
 }
@@ -267,6 +212,56 @@ pub fn run_blank_check(
     address_start: u64,
     address_end: u64,
     read_flasher_rtt: bool,
+) -> Result<(), FlashError> {
+    erase_inner(
+        session,
+        progress,
+        address_start,
+        address_end,
+        read_flasher_rtt,
+        Flasher::run_verify,
+        |sectors| {
+            move |active, _| {
+                sectors
+                    .iter()
+                    .map(
+                        |&SectorInfo {
+                             base_address: address,
+                             size,
+                         }| FlashSector { address, size },
+                    )
+                    .try_for_each(|sector| {
+                        tracing::debug!(
+                            "    sector: {:#010x}-{:#010x} ({} bytes)",
+                            sector.address,
+                            sector.address + sector.size,
+                            sector.size
+                        );
+
+                        active.blank_check(&sector)
+                    })
+            }
+        },
+    )?;
+
+    Ok(())
+}
+
+fn erase_inner<
+    'p,
+    T,
+    O: Operation,
+    H: Fn(Vec<SectorInfo>) -> G,
+    G: FnMut(&mut ActiveFlasher<'_, 'p, O>, &mut [LoadedRegion]) -> Result<T, FlashError> + Clone,
+    F: FnMut(&mut Flasher, &mut Session, &mut FlashProgress<'p>, G) -> Result<T, FlashError>,
+>(
+    session: &mut Session,
+    progress: &mut FlashProgress<'p>,
+    address_start: u64,
+    address_end: u64,
+    read_flasher_rtt: bool,
+    mut inner_fn: F,
+    h: H,
 ) -> Result<(), FlashError> {
     tracing::debug!("Blank-checking {address_start:08x}..{address_end:08x}");
 
@@ -294,7 +289,6 @@ pub fn run_blank_check(
             tracing::debug!("     -- doesn't overlap, ignoring!");
             continue;
         }
-
         // Get the first core that can access the region
         let core_name = region
             .cores
@@ -311,9 +305,8 @@ pub fn run_blank_check(
 
         tracing::debug!("     -- using algorithm: {}", algo.name);
     }
-
     for ((algo_name, core_name), regions) in algos {
-        tracing::debug!("Blank-checking with algorithm: {}", algo_name);
+        tracing::debug!("Erasing with algorithm: {}", algo_name);
 
         // This can't fail, algo_name comes from the target.
         let algo = session.target().flash_algorithm_by_name(&algo_name);
@@ -324,7 +317,7 @@ pub fn run_blank_check(
 
         flasher.read_rtt_output(read_flasher_rtt);
 
-        let sectors = flasher
+        let sectors: Vec<_> = flasher
             .flash_algorithm()
             .iter_sectors()
             .filter(|info| address_range.contains_range(&info.address_range()))
@@ -332,26 +325,9 @@ pub fn run_blank_check(
                 let range = info.base_address..info.base_address + info.size;
                 regions.iter().any(|r| r.range.contains_range(&range))
             })
-            .collect::<Vec<_>>();
+            .collect();
 
-        flasher.run_verify(session, progress, |active, _| {
-            for info in sectors {
-                tracing::debug!(
-                    "    sector: {:#010x}-{:#010x} ({} bytes)",
-                    info.base_address,
-                    info.base_address + info.size,
-                    info.size
-                );
-
-                let sector = FlashSector {
-                    address: info.base_address,
-                    size: info.size,
-                };
-
-                active.blank_check(&sector)?;
-            }
-            Ok(())
-        })?;
+        inner_fn(&mut flasher, session, progress, h(sectors))?;
     }
 
     Ok(())
