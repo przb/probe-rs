@@ -247,14 +247,7 @@ pub fn run_blank_check(
     Ok(())
 }
 
-fn erase_inner<
-    'p,
-    T,
-    O: Operation,
-    H: Fn(Vec<SectorInfo>) -> G,
-    G: FnMut(&mut ActiveFlasher<'_, 'p, O>, &mut [LoadedRegion]) -> Result<T, FlashError> + Clone,
-    F: FnMut(&mut Flasher, &mut Session, &mut FlashProgress<'p>, G) -> Result<T, FlashError>,
->(
+fn erase_inner<'p, T, O, H, G, F>(
     session: &mut Session,
     progress: &mut FlashProgress<'p>,
     address_start: u64,
@@ -262,7 +255,13 @@ fn erase_inner<
     read_flasher_rtt: bool,
     mut inner_fn: F,
     h: H,
-) -> Result<(), FlashError> {
+) -> Result<(), FlashError>
+where
+    O: Operation,
+    H: Fn(Vec<SectorInfo>) -> G,
+    G: FnMut(&mut ActiveFlasher<'_, 'p, O>, &mut [LoadedRegion]) -> Result<T, FlashError> + Clone,
+    F: FnMut(&mut Flasher, &mut Session, &mut FlashProgress<'p>, G) -> Result<T, FlashError>,
+{
     tracing::debug!("Blank-checking {address_start:08x}..{address_end:08x}");
 
     let address_range = address_start..address_end;
